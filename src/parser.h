@@ -12,6 +12,14 @@ extern "C" {
 
 #define MAX_LINK_LABEL_LENGTH 1000
 
+// Per-line offset tracking for accurate inline sourcepos in lazy continuations
+typedef struct cmark_line_offsets_entry {
+  struct cmark_node *node;
+  int16_t *offsets;
+  int count;
+  struct cmark_line_offsets_entry *next;
+} cmark_line_offsets_entry;
+
 struct cmark_parser {
   struct cmark_mem *mem;
   struct cmark_reference_map *refmap;
@@ -30,6 +38,8 @@ struct cmark_parser {
   bufsize_t last_line_length;
   cmark_strbuf linebuf;
   cmark_strbuf content;
+  cmark_strbuf line_offsets;              // int16_t per line: source column where line starts
+  cmark_line_offsets_entry *pending_line_offsets;  // Linked list for finalized nodes
   int options;
   bool last_buffer_ended_with_cr;
   unsigned int total_size;

@@ -1154,6 +1154,110 @@ static void ref_source_pos(test_batch_runner *runner) {
   cmark_node_free(doc);
 }
 
+static void lazy_continuation_sourcepos(test_batch_runner *runner) {
+  // Note: CMARK_OPT_SOURCEPOS must be passed to cmark_parse_document() to enable
+  // per-line offset tracking for accurate inline sourcepos on continuation lines.
+
+  // Test 1: List lazy continuation - bold should start at column 1
+  {
+    static const char markdown[] = "- Line One\n**Bold** Text";
+    cmark_node *doc = cmark_parse_document(markdown, sizeof(markdown) - 1, CMARK_OPT_SOURCEPOS);
+    char *xml = cmark_render_xml(doc, CMARK_OPT_SOURCEPOS);
+    // **Bold** on line 2 should start at column 1, not column 3
+    OK(runner, strstr(xml, "strong sourcepos=\"2:1-2:8\"") != NULL,
+       "list lazy continuation: bold starts at column 1");
+    free(xml);
+    cmark_node_free(doc);
+  }
+
+  // Test 2: List with 6-space indent (different offset than line 1)
+  {
+    static const char markdown[] = "- Test\n      - `Line 2`";
+    cmark_node *doc = cmark_parse_document(markdown, sizeof(markdown) - 1, CMARK_OPT_SOURCEPOS);
+    char *xml = cmark_render_xml(doc, CMARK_OPT_SOURCEPOS);
+    // The backtick starts at column 9, "Line 2" is columns 10-15
+    OK(runner, strstr(xml, "code sourcepos=\"2:10-2:15\"") != NULL,
+       "list 6-space indent: code at correct column");
+    free(xml);
+    cmark_node_free(doc);
+  }
+
+  // Test 3: Blockquote lazy continuation
+  {
+    static const char markdown[] = "> text\nlazy *italic*";
+    cmark_node *doc = cmark_parse_document(markdown, sizeof(markdown) - 1, CMARK_OPT_SOURCEPOS);
+    char *xml = cmark_render_xml(doc, CMARK_OPT_SOURCEPOS);
+    // *italic* on line 2 should be at column 6, not offset by blockquote prefix
+    OK(runner, strstr(xml, "emph sourcepos=\"2:6-2:13\"") != NULL,
+       "blockquote lazy continuation: emph at column 6");
+    free(xml);
+    cmark_node_free(doc);
+  }
+
+  // Test 4: Ordered list lazy continuation
+  {
+    static const char markdown[] = "1. First\n**Bold** second";
+    cmark_node *doc = cmark_parse_document(markdown, sizeof(markdown) - 1, CMARK_OPT_SOURCEPOS);
+    char *xml = cmark_render_xml(doc, CMARK_OPT_SOURCEPOS);
+    // **Bold** on line 2 should start at column 1, not column 4
+    OK(runner, strstr(xml, "strong sourcepos=\"2:1-2:8\"") != NULL,
+       "ordered list lazy continuation: bold at column 1");
+    free(xml);
+    cmark_node_free(doc);
+  }
+
+  // Test 5: Nested blockquote lazy continuation
+  {
+    static const char markdown[] = ">> text\nlazy *bold*";
+    cmark_node *doc = cmark_parse_document(markdown, sizeof(markdown) - 1, CMARK_OPT_SOURCEPOS);
+    char *xml = cmark_render_xml(doc, CMARK_OPT_SOURCEPOS);
+    // *bold* on line 2 should be at column 6
+    OK(runner, strstr(xml, "emph sourcepos=\"2:6-2:11\"") != NULL,
+       "nested blockquote lazy: emph at column 6");
+    free(xml);
+    cmark_node_free(doc);
+  }
+
+  // Test 6: List with proper 2-space indent (regression check - should still work)
+  {
+    static const char markdown[] = "- Line 1\n  `Line 2`";
+    cmark_node *doc = cmark_parse_document(markdown, sizeof(markdown) - 1, CMARK_OPT_SOURCEPOS);
+    char *xml = cmark_render_xml(doc, CMARK_OPT_SOURCEPOS);
+    // With 2-space indent, backtick at column 3, "Line 2" at columns 4-9
+    OK(runner, strstr(xml, "code sourcepos=\"2:4-2:9\"") != NULL,
+       "list 2-space indent (regression): code at column 4");
+    free(xml);
+    cmark_node_free(doc);
+  }
+
+  // Test 7: Code block followed by paragraph - offsets should not leak
+  // This tests that code block line offsets are cleared before the next block
+  {
+    static const char markdown[] = "    code line 1\n    code line 2\n\n**Bold** text";
+    cmark_node *doc = cmark_parse_document(markdown, sizeof(markdown) - 1, CMARK_OPT_SOURCEPOS);
+    char *xml = cmark_render_xml(doc, CMARK_OPT_SOURCEPOS);
+    // The paragraph is on line 4, **Bold** should start at column 1
+    // If code block offsets leak, this would be wrong (offset by code block's column 5)
+    OK(runner, strstr(xml, "strong sourcepos=\"4:1-4:8\"") != NULL,
+       "code block followed by paragraph: bold at column 1 (no offset leak)");
+    free(xml);
+    cmark_node_free(doc);
+  }
+
+  // Test 8: ATX heading - internal_offset should not be applied twice
+  // "# Hello *world*" - emph should be at column 9-15 (after "# Hello ")
+  {
+    static const char markdown[] = "# Hello *world*";
+    cmark_node *doc = cmark_parse_document(markdown, sizeof(markdown) - 1, CMARK_OPT_SOURCEPOS);
+    char *xml = cmark_render_xml(doc, CMARK_OPT_SOURCEPOS);
+    // *world* starts at column 9 (after "# Hello "), ends at column 15
+    OK(runner, strstr(xml, "emph sourcepos=\"1:9-1:15\"") != NULL,
+       "ATX heading: emph at correct column (no double internal_offset)");
+    free(xml);
+    cmark_node_free(doc);
+  }
+}
+
 int main(void) {
   int retval;
   test_batch_runner *runner = test_batch_runner_new();
@@ -1185,6 +1289,7 @@ int main(void) {
   source_pos(runner);
   source_pos_inlines(runner);
   ref_source_pos(runner);
+  lazy_continuation_sourcepos(runner);
 
   test_print_summary(runner);
   retval = test_ok(runner) ? 0 : 1;

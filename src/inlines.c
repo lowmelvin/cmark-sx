@@ -62,6 +62,9 @@ typedef struct {
   bufsize_t pos;
   int block_offset;
   int column_offset;
+  int16_t *line_offsets;  // Per-line starting columns (1-based), NULL if not tracking
+  int line_count;         // Number of entries in line_offsets
+  int line_index;         // Current line index (0-based)
   cmark_reference_map *refmap;
   delimiter *last_delim;
   bracket *last_bracket;
@@ -80,7 +83,8 @@ static delimiter *S_insert_emph(subject *subj, delimiter *opener,
 static int parse_inline(subject *subj, cmark_node *parent, int options);
 
 static void subject_from_buf(cmark_mem *mem, int line_number, int block_offset, subject *e,
-                             cmark_chunk *chunk, cmark_reference_map *refmap);
+                             cmark_chunk *chunk, cmark_reference_map *refmap,
+                             int16_t *line_offsets, int line_count);
 static bufsize_t subject_find_special_char(subject *subj, int options);
 
 // Create an inline with a literal string value.
@@ -193,15 +197,26 @@ static inline cmark_node *make_autolink(subject *subj, int start_column,
 }
 
 static void subject_from_buf(cmark_mem *mem, int line_number, int block_offset, subject *e,
-                             cmark_chunk *chunk, cmark_reference_map *refmap) {
+                             cmark_chunk *chunk, cmark_reference_map *refmap,
+                             int16_t *line_offsets, int line_count) {
   int i;
   e->mem = mem;
   e->input = *chunk;
   e->flags = 0;
   e->line = line_number;
   e->pos = 0;
-  e->block_offset = block_offset;
   e->column_offset = 0;
+  e->line_offsets = line_offsets;
+  e->line_count = line_count;
+  e->line_index = 0;
+
+  // Use first line's offset if available, otherwise use the block_offset parameter
+  if (line_offsets && line_count > 0) {
+    e->block_offset = line_offsets[0] - 1;  // Convert 1-based to 0-based
+  } else {
+    e->block_offset = block_offset;
+  }
+
   e->refmap = refmap;
   e->last_delim = NULL;
   e->last_bracket = NULL;
@@ -304,8 +319,16 @@ static void adjust_subj_node_newlines(subject *subj, cmark_node *node, int match
   int newlines = count_newlines(subj, subj->pos - matchlen - extra, matchlen, &since_newline);
   if (newlines) {
     subj->line += newlines;
+    subj->line_index += newlines;
     node->end_line += newlines;
-    node->end_column = since_newline;
+
+    // Update block_offset for the new line if we have per-line offsets
+    if (subj->line_offsets && subj->line_index < subj->line_count) {
+      subj->block_offset = subj->line_offsets[subj->line_index] - 1;  // Convert 1-based to 0-based
+      node->end_column = since_newline + subj->block_offset + 1;  // Recalculate with new offset
+    } else {
+      node->end_column = since_newline;
+    }
     subj->column_offset = -subj->pos + since_newline + extra;
   }
 }
@@ -1273,7 +1296,14 @@ static cmark_node *handle_newline(subject *subj) {
     advance(subj);
   }
   ++subj->line;
+  ++subj->line_index;
+
+  // Update block_offset for the new line if we have per-line offsets
+  if (subj->line_offsets && subj->line_index < subj->line_count) {
+    subj->block_offset = subj->line_offsets[subj->line_index] - 1;  // Convert 1-based to 0-based
+  }
   subj->column_offset = -subj->pos;
+
   // skip spaces at beginning of line
   skip_spaces(subj);
   if (nlpos > 1 && peek_at(subj, nlpos - 1) == ' ' &&
@@ -1407,12 +1437,19 @@ static int parse_inline(subject *subj, cmark_node *parent, int options) {
 
 // Parse inlines from parent's string_content, adding as children of parent.
 void cmark_parse_inlines(cmark_mem *mem, cmark_node *parent,
-                         cmark_reference_map *refmap, int options) {
+                         cmark_reference_map *refmap, int options,
+                         int16_t *line_offsets, int line_count) {
   int internal_offset = parent->type == CMARK_NODE_HEADING ?
     parent->as.heading.internal_offset : 0;
   subject subj;
   cmark_chunk content = {parent->data, parent->len};
-  subject_from_buf(mem, parent->start_line, parent->start_column - 1 + internal_offset, &subj, &content, refmap);
+
+  subject_from_buf(mem, parent->start_line, parent->start_column - 1 + internal_offset,
+                   &subj, &content, refmap, line_offsets, line_count);
+  // Note: When line_offsets is provided, subject_from_buf uses line_offsets[0] which
+  // already captures the correct column where content starts (after ATX marker, etc.),
+  // so we do NOT add internal_offset again here.
+
   cmark_chunk_rtrim(&subj.input);
 
   while (!is_eof(&subj) && parse_inline(&subj, parent, options))
@@ -1451,7 +1488,7 @@ bufsize_t cmark_parse_reference_inline(cmark_mem *mem, cmark_chunk *input,
   bufsize_t matchlen = 0;
   bufsize_t beforetitle;
 
-  subject_from_buf(mem, -1, 0, &subj, input, NULL);
+  subject_from_buf(mem, -1, 0, &subj, input, NULL, NULL, 0);
 
   // parse label:
   if (!link_label(&subj, &lab) || lab.len == 0)

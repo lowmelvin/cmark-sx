@@ -97,6 +97,8 @@ cmark_parser *cmark_parser_new_with_mem_into_root(int options, cmark_mem *mem, c
   cmark_strbuf_init(mem, &parser->curline, 256);
   cmark_strbuf_init(mem, &parser->linebuf, 0);
   cmark_strbuf_init(mem, &parser->content, 0);
+  cmark_strbuf_init(mem, &parser->line_offsets, 0);
+  parser->pending_line_offsets = NULL;
 
   root->flags = CMARK_NODE__OPEN;
 
@@ -133,6 +135,15 @@ void cmark_parser_free(cmark_parser *parser) {
   cmark_mem *mem = parser->mem;
   cmark_strbuf_free(&parser->curline);
   cmark_strbuf_free(&parser->linebuf);
+  cmark_strbuf_free(&parser->line_offsets);
+  // Free any remaining pending line offsets
+  cmark_line_offsets_entry *entry = parser->pending_line_offsets;
+  while (entry) {
+    cmark_line_offsets_entry *next = entry->next;
+    mem->free(entry->offsets);
+    mem->free(entry);
+    entry = next;
+  }
   cmark_reference_map_free(parser->refmap);
   mem->free(parser);
 }
@@ -182,6 +193,13 @@ static inline bool contains_inlines(cmark_node_type block_type) {
 static void add_line(cmark_chunk *ch, cmark_parser *parser) {
   int chars_to_tab;
   int i;
+
+  // Record line start column for accurate inline sourcepos (1-based)
+  if (parser->options & CMARK_OPT_SOURCEPOS) {
+    int16_t col = (int16_t)(parser->column + 1);
+    cmark_strbuf_put(&parser->line_offsets, (unsigned char *)&col, sizeof(int16_t));
+  }
+
   if (parser->partially_consumed_tab) {
     parser->offset += 1; // skip over tab
     // add space characters:
@@ -236,6 +254,15 @@ static bool S_ends_with_blank_line(cmark_node *node) {
   }
 }
 
+// Count newlines in a byte range
+static int count_newlines_in_bytes(const unsigned char *data, bufsize_t len) {
+  int count = 0;
+  for (bufsize_t i = 0; i < len; i++) {
+    if (data[i] == '\n') count++;
+  }
+  return count;
+}
+
 // returns true if content remains after link defs are resolved.
 static bool resolve_reference_link_definitions(cmark_parser *parser) {
   bufsize_t pos;
@@ -248,8 +275,47 @@ static bool resolve_reference_link_definitions(cmark_parser *parser) {
     chunk.data += pos;
     chunk.len -= pos;
   }
-  cmark_strbuf_drop(node_content, (node_content->size - chunk.len));
+  bufsize_t bytes_dropped = node_content->size - chunk.len;
+
+  // Count newlines in dropped portion BEFORE the drop (for line offset tracking)
+  int lines_dropped = 0;
+  if ((parser->options & CMARK_OPT_SOURCEPOS) && bytes_dropped > 0) {
+    lines_dropped = count_newlines_in_bytes(node_content->ptr, bytes_dropped);
+  }
+
+  cmark_strbuf_drop(node_content, bytes_dropped);
+
+  // Also drop corresponding line offsets for stripped reference definitions
+  if (lines_dropped > 0) {
+    cmark_strbuf_drop(&parser->line_offsets, lines_dropped * sizeof(int16_t));
+  }
+
   return !is_blank(node_content, 0);
+}
+
+// Store line offsets for inline parsing (adds to linked list)
+static void store_line_offsets_for_node(cmark_parser *parser, cmark_node *node) {
+  if (!(parser->options & CMARK_OPT_SOURCEPOS) ||
+      parser->line_offsets.size == 0) {
+    return;
+  }
+
+  cmark_mem *mem = parser->mem;
+  int count = parser->line_offsets.size / sizeof(int16_t);
+
+  cmark_line_offsets_entry *entry =
+      (cmark_line_offsets_entry *)mem->calloc(1, sizeof(cmark_line_offsets_entry));
+  entry->node = node;
+  entry->count = count;
+  entry->offsets = (int16_t *)mem->realloc(NULL, parser->line_offsets.size);
+  memcpy(entry->offsets, parser->line_offsets.ptr, parser->line_offsets.size);
+
+  // Prepend to linked list
+  entry->next = parser->pending_line_offsets;
+  parser->pending_line_offsets = entry;
+
+  // Clear the buffer for the next block
+  cmark_strbuf_clear(&parser->line_offsets);
 }
 
 static cmark_node *finalize(cmark_parser *parser, cmark_node *b) {
@@ -291,9 +357,11 @@ static cmark_node *finalize(cmark_parser *parser, cmark_node *b) {
     if (!has_content) {
       // remove blank node (former reference def)
       cmark_node_free(b);
+      cmark_strbuf_clear(&parser->line_offsets);  // Discard unused offsets
     } else {
       b->len = node_content->size;
       b->data = cmark_strbuf_detach(node_content);
+      store_line_offsets_for_node(parser, b);
     }
     break;
   }
@@ -328,12 +396,25 @@ static cmark_node *finalize(cmark_parser *parser, cmark_node *b) {
     }
     b->len = node_content->size;
     b->data = cmark_strbuf_detach(node_content);
+    // Clear line offsets - code blocks don't use inline sourcepos
+    if (parser->options & CMARK_OPT_SOURCEPOS) {
+      cmark_strbuf_clear(&parser->line_offsets);
+    }
     break;
 
   case CMARK_NODE_HEADING:
+    b->len = node_content->size;
+    b->data = cmark_strbuf_detach(node_content);
+    store_line_offsets_for_node(parser, b);
+    break;
+
   case CMARK_NODE_HTML_BLOCK:
     b->len = node_content->size;
     b->data = cmark_strbuf_detach(node_content);
+    // Clear line offsets - HTML blocks don't use inline sourcepos
+    if (parser->options & CMARK_OPT_SOURCEPOS) {
+      cmark_strbuf_clear(&parser->line_offsets);
+    }
     break;
 
   case CMARK_NODE_LIST:      // determine tight/loose status
@@ -400,8 +481,33 @@ static cmark_node *add_child(cmark_parser *parser, cmark_node *parent,
 
 // Walk through node and all children, recursively, parsing
 // string content into inline content where appropriate.
+// Retrieve and remove line offsets for a node from the pending list
+static void retrieve_line_offsets(cmark_line_offsets_entry **list,
+                                  cmark_node *node, cmark_mem *mem,
+                                  int16_t **offsets_out, int *count_out) {
+  *offsets_out = NULL;
+  *count_out = 0;
+
+  cmark_line_offsets_entry **prev = list;
+  cmark_line_offsets_entry *entry = *list;
+
+  while (entry) {
+    if (entry->node == node) {
+      *offsets_out = entry->offsets;
+      *count_out = entry->count;
+      // Remove from list
+      *prev = entry->next;
+      mem->free(entry);
+      return;
+    }
+    prev = &entry->next;
+    entry = entry->next;
+  }
+}
+
 static void process_inlines(cmark_mem *mem, cmark_node *root,
-                            cmark_reference_map *refmap, int options) {
+                            cmark_reference_map *refmap, int options,
+                            cmark_line_offsets_entry **pending_offsets) {
   cmark_iter *iter = cmark_iter_new(root);
   cmark_node *cur;
   cmark_event_type ev_type;
@@ -410,7 +516,19 @@ static void process_inlines(cmark_mem *mem, cmark_node *root,
     cur = cmark_iter_get_node(iter);
     if (ev_type == CMARK_EVENT_ENTER) {
       if (contains_inlines(S_type(cur))) {
-        cmark_parse_inlines(mem, cur, refmap, options);
+        int16_t *line_offsets = NULL;
+        int line_count = 0;
+
+        if (options & CMARK_OPT_SOURCEPOS) {
+          retrieve_line_offsets(pending_offsets, cur, mem,
+                                &line_offsets, &line_count);
+        }
+
+        cmark_parse_inlines(mem, cur, refmap, options, line_offsets, line_count);
+
+        if (line_offsets) {
+          mem->free(line_offsets);
+        }
         mem->free(cur->data);
         cur->data = NULL;
         cur->len = 0;
@@ -532,9 +650,11 @@ static cmark_node *finalize_document(cmark_parser *parser) {
   else
     parser->refmap->max_ref_size = 100000;
 
-  process_inlines(parser->mem, parser->root, parser->refmap, parser->options);
+  process_inlines(parser->mem, parser->root, parser->refmap, parser->options,
+                  &parser->pending_line_offsets);
 
   cmark_strbuf_free(&parser->content);
+  cmark_strbuf_free(&parser->line_offsets);
 
   return parser->root;
 }

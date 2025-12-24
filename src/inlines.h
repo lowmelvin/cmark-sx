@@ -12,7 +12,8 @@ unsigned char *cmark_clean_url(cmark_mem *mem, cmark_chunk *url);
 unsigned char *cmark_clean_title(cmark_mem *mem, cmark_chunk *title);
 
 void cmark_parse_inlines(cmark_mem *mem, cmark_node *parent,
-                         cmark_reference_map *refmap, int options);
+                         cmark_reference_map *refmap, int options,
+                         int16_t *line_offsets, int line_count);
 
 bufsize_t cmark_parse_reference_inline(cmark_mem *mem, cmark_chunk *input,
                                        cmark_reference_map *refmap);
