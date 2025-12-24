@@ -388,6 +388,15 @@ static int S_render_node(cmark_renderer *renderer, cmark_node *node,
     }
     break;
 
+  case CMARK_NODE_STRIKETHROUGH:
+    // requires \usepackage{ulem}
+    if (entering) {
+      LIT("\\sout{");
+    } else {
+      LIT("}");
+    }
+    break;
+
   case CMARK_NODE_EMPH:
     if (entering) {
       LIT("\\emph{");

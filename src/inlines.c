@@ -26,6 +26,7 @@ static const char *RIGHTSINGLEQUOTE = "\xE2\x80\x99";
 #define make_softbreak(mem) make_simple(mem, CMARK_NODE_SOFTBREAK)
 #define make_emph(mem) make_simple(mem, CMARK_NODE_EMPH)
 #define make_strong(mem) make_simple(mem, CMARK_NODE_STRONG)
+#define make_strikethrough(mem) make_simple(mem, CMARK_NODE_STRIKETHROUGH)
 
 #define MAXBACKTICKS 1000
 
@@ -79,6 +80,9 @@ static inline bool S_is_line_end_char(char c) {
 
 static delimiter *S_insert_emph(subject *subj, delimiter *opener,
                                 delimiter *closer);
+
+static delimiter *S_insert_strikethrough(subject *subj, delimiter *opener,
+                                         delimiter *closer);
 
 static int parse_inline(subject *subj, cmark_node *parent, int options);
 
@@ -504,6 +508,10 @@ static int scan_delims(subject *subj, unsigned char c, bool *can_open,
          (!right_flanking || before_char == '(' || before_char == '[') &&
          before_char != ']' && before_char != ')';
     *can_close = right_flanking;
+  } else if (c == '~') {
+    // Strikethrough uses same flanking rules as *
+    *can_open = left_flanking;
+    *can_close = right_flanking;
   } else {
     *can_open = left_flanking;
     *can_close = right_flanking;
@@ -612,6 +620,28 @@ static cmark_node *handle_delim(subject *subj, unsigned char c, bool smart) {
   return inl_text;
 }
 
+// Assumes the subject has a ~ at the current position.
+// Only creates delimiter for exactly 2 tildes when strikethrough is enabled.
+static cmark_node *handle_tilde(subject *subj, int options) {
+  bufsize_t numdelims;
+  cmark_node *inl_text;
+  bool can_open, can_close;
+  cmark_chunk contents;
+
+  numdelims = scan_delims(subj, '~', &can_open, &can_close);
+
+  contents = cmark_chunk_dup(&subj->input, subj->pos - numdelims, numdelims);
+  inl_text = make_str(subj, subj->pos - numdelims, subj->pos - 1, contents);
+
+  // Only push delimiter for exactly 2 tildes when strikethrough is enabled
+  if ((options & CMARK_OPT_STRIKETHROUGH) && numdelims == 2 &&
+      (can_open || can_close)) {
+    push_delimiter(subj, '~', can_open, can_close, inl_text);
+  }
+
+  return inl_text;
+}
+
 // Assumes we have a hyphen at the current position.
 static cmark_node *handle_hyphen(subject *subj, bool smart) {
   int startpos = subj->pos;
@@ -678,11 +708,12 @@ static void process_emphasis(subject *subj, bufsize_t stack_bottom) {
   delimiter *old_closer;
   bool opener_found;
   int openers_bottom_index = 0;
-  bufsize_t openers_bottom[15] = {stack_bottom, stack_bottom, stack_bottom,
+  bufsize_t openers_bottom[16] = {stack_bottom, stack_bottom, stack_bottom,
                                   stack_bottom, stack_bottom, stack_bottom,
                                   stack_bottom, stack_bottom, stack_bottom,
                                   stack_bottom, stack_bottom, stack_bottom,
-                                  stack_bottom, stack_bottom, stack_bottom};
+                                  stack_bottom, stack_bottom, stack_bottom,
+                                  stack_bottom};
 
   // move back to first relevant delim.
   candidate = subj->last_delim;
@@ -709,8 +740,11 @@ static void process_emphasis(subject *subj, bufsize_t stack_bottom) {
         openers_bottom_index = 8 +
                 (closer->can_open ? 3 : 0) + (closer->length % 3);
         break;
+      case '~':
+        openers_bottom_index = 14;
+        break;
       default:
-        assert(false);
+        break;
       }
 
       // Now look backwards for first matching opener:
@@ -734,6 +768,12 @@ static void process_emphasis(subject *subj, bufsize_t stack_bottom) {
       if (closer->delim_char == '*' || closer->delim_char == '_') {
         if (opener_found) {
           closer = S_insert_emph(subj, opener, closer);
+        } else {
+          closer = closer->next;
+        }
+      } else if (closer->delim_char == '~') {
+        if (opener_found) {
+          closer = S_insert_strikethrough(subj, opener, closer);
         } else {
           closer = closer->next;
         }
@@ -854,6 +894,59 @@ static delimiter *S_insert_emph(subject *subj, delimiter *opener,
   }
 
   return closer;
+}
+
+static delimiter *S_insert_strikethrough(subject *subj, delimiter *opener,
+                                         delimiter *closer) {
+  delimiter *delim, *tmp_delim;
+  cmark_node *opener_inl = opener->inl_text;
+  cmark_node *closer_inl = closer->inl_text;
+  cmark_node *tmp, *tmpnext, *strike;
+
+  // free delimiters between opener and closer
+  delim = closer->previous;
+  while (delim != NULL && delim != opener) {
+    tmp_delim = delim->previous;
+    remove_delimiter(subj, delim);
+    delim = tmp_delim;
+  }
+
+  // create strikethrough node
+  strike = make_strikethrough(subj->mem);
+
+  // move nodes between opener and closer into strikethrough as children
+  tmp = opener_inl->next;
+  while (tmp && tmp != closer_inl) {
+    tmpnext = tmp->next;
+    cmark_node_append_child(strike, tmp);
+    tmp = tmpnext;
+  }
+
+  // insert strikethrough between opener and closer in the node list
+  opener_inl->next = strike;
+  closer_inl->prev = strike;
+  strike->prev = opener_inl;
+  strike->next = closer_inl;
+  strike->parent = opener_inl->parent;
+
+  // Set sourcepos from opener and closer (which have correct positions
+  // including line_offsets for lazy continuation lines)
+  // Include the ~~ delimiters in the sourcepos (like emph includes * or _)
+  strike->start_line = opener_inl->start_line;
+  strike->end_line = closer_inl->end_line;
+  strike->start_column = opener_inl->start_column;
+  strike->end_column = closer_inl->end_column;
+
+  // Strikethrough always uses exactly 2 tildes, so remove opener and closer
+  cmark_node_free(opener_inl);
+  cmark_node_free(closer_inl);
+
+  // Remove both delimiters from stack
+  tmp_delim = closer->next;
+  remove_delimiter(subj, closer);
+  remove_delimiter(subj, opener);
+
+  return tmp_delim;
 }
 
 // Parse backslash-escape or just a backslash, returning an inline.
@@ -1349,7 +1442,9 @@ static bufsize_t subject_find_special_char(subject *subj, int options) {
   while (n < subj->input.len) {
     if (SPECIAL_CHARS[subj->input.data[n]])
       return n;
-    if (options & CMARK_OPT_SMART && SMART_PUNCT_CHARS[subj->input.data[n]])
+    if ((options & CMARK_OPT_SMART) && SMART_PUNCT_CHARS[subj->input.data[n]])
+      return n;
+    if ((options & CMARK_OPT_STRIKETHROUGH) && subj->input.data[n] == '~')
       return n;
     n++;
   }
@@ -1414,6 +1509,9 @@ static int parse_inline(subject *subj, cmark_node *parent, int options) {
     } else {
       new_inl = make_str(subj, subj->pos - 1, subj->pos - 1, cmark_chunk_literal("!"));
     }
+    break;
+  case '~':
+    new_inl = handle_tilde(subj, options);
     break;
   default:
     endpos = subject_find_special_char(subj, options);

@@ -17,7 +17,8 @@ static const cmark_node_type node_types[] = {
     CMARK_NODE_PARAGRAPH, CMARK_NODE_HEADING,     CMARK_NODE_THEMATIC_BREAK,
     CMARK_NODE_TEXT,      CMARK_NODE_SOFTBREAK,   CMARK_NODE_LINEBREAK,
     CMARK_NODE_CODE,      CMARK_NODE_HTML_INLINE, CMARK_NODE_EMPH,
-    CMARK_NODE_STRONG,    CMARK_NODE_LINK,        CMARK_NODE_IMAGE};
+    CMARK_NODE_STRONG,    CMARK_NODE_STRIKETHROUGH, CMARK_NODE_LINK,
+    CMARK_NODE_IMAGE};
 static const int num_node_types = sizeof(node_types) / sizeof(*node_types);
 
 static void test_md_to_html(test_batch_runner *runner, const char *markdown,
@@ -481,8 +482,8 @@ void hierarchy(test_batch_runner *runner) {
   int all_inlines = (1 << CMARK_NODE_TEXT) | (1 << CMARK_NODE_SOFTBREAK) |
                     (1 << CMARK_NODE_LINEBREAK) | (1 << CMARK_NODE_CODE) |
                     (1 << CMARK_NODE_HTML_INLINE) | (1 << CMARK_NODE_EMPH) |
-                    (1 << CMARK_NODE_STRONG) | (1 << CMARK_NODE_LINK) |
-                    (1 << CMARK_NODE_IMAGE);
+                    (1 << CMARK_NODE_STRONG) | (1 << CMARK_NODE_STRIKETHROUGH) |
+                    (1 << CMARK_NODE_LINK) | (1 << CMARK_NODE_IMAGE);
 
   test_content(runner, CMARK_NODE_DOCUMENT, top_level_blocks);
   test_content(runner, CMARK_NODE_BLOCK_QUOTE, top_level_blocks);
@@ -500,6 +501,7 @@ void hierarchy(test_batch_runner *runner) {
   test_content(runner, CMARK_NODE_HTML_INLINE, 0);
   test_content(runner, CMARK_NODE_EMPH, all_inlines);
   test_content(runner, CMARK_NODE_STRONG, all_inlines);
+  test_content(runner, CMARK_NODE_STRIKETHROUGH, all_inlines);
   test_content(runner, CMARK_NODE_LINK, all_inlines);
   test_content(runner, CMARK_NODE_IMAGE, all_inlines);
 }
@@ -1258,6 +1260,93 @@ static void lazy_continuation_sourcepos(test_batch_runner *runner) {
   }
 }
 
+static void strikethrough(test_batch_runner *runner) {
+  char *html;
+
+  // Test: basic strikethrough
+  html = cmark_markdown_to_html("~~deleted~~", 11,
+                                CMARK_OPT_STRIKETHROUGH);
+  STR_EQ(runner, html, "<p><del>deleted</del></p>\n",
+         "basic strikethrough");
+  free(html);
+
+  // Test: single tilde should not be strikethrough
+  html = cmark_markdown_to_html("~not deleted~", 13,
+                                CMARK_OPT_STRIKETHROUGH);
+  STR_EQ(runner, html, "<p>~not deleted~</p>\n",
+         "single tilde not strikethrough");
+  free(html);
+
+  // Test: three tildes inline should not be strikethrough
+  // (Using inline context to avoid code fence interpretation)
+  html = cmark_markdown_to_html("a~~~b~~~c", 9,
+                                CMARK_OPT_STRIKETHROUGH);
+  STR_EQ(runner, html, "<p>a~~~b~~~c</p>\n",
+         "three tildes inline not strikethrough");
+  free(html);
+
+  // Test: strikethrough disabled by default
+  html = cmark_markdown_to_html("~~text~~", 8, CMARK_OPT_DEFAULT);
+  STR_EQ(runner, html, "<p>~~text~~</p>\n",
+         "strikethrough disabled by default");
+  free(html);
+
+  // Test: nested emphasis inside strikethrough
+  html = cmark_markdown_to_html("~~*bold* text~~", 15,
+                                CMARK_OPT_STRIKETHROUGH);
+  STR_EQ(runner, html, "<p><del><em>bold</em> text</del></p>\n",
+         "emphasis inside strikethrough");
+  free(html);
+
+  // Test: strikethrough inside emphasis
+  html = cmark_markdown_to_html("*~~text~~ more*", 15,
+                                CMARK_OPT_STRIKETHROUGH);
+  STR_EQ(runner, html, "<p><em><del>text</del> more</em></p>\n",
+         "strikethrough inside emphasis");
+  free(html);
+
+  // Test: unmatched strikethrough
+  html = cmark_markdown_to_html("~~unmatched", 11,
+                                CMARK_OPT_STRIKETHROUGH);
+  STR_EQ(runner, html, "<p>~~unmatched</p>\n",
+         "unmatched strikethrough");
+  free(html);
+
+  // Test: strikethrough with mismatched counts
+  html = cmark_markdown_to_html("~~text~~~", 9,
+                                CMARK_OPT_STRIKETHROUGH);
+  STR_EQ(runner, html, "<p>~~text~~~</p>\n",
+         "mismatched tilde counts");
+  free(html);
+
+  // Test: escaped tilde
+  html = cmark_markdown_to_html("\\~~not deleted~~", 16,
+                                CMARK_OPT_STRIKETHROUGH);
+  STR_EQ(runner, html, "<p>~~not deleted~~</p>\n",
+         "escaped tilde");
+  free(html);
+
+  // Test: strikethrough spanning lines
+  html = cmark_markdown_to_html("~~line one\nline two~~", 21,
+                                CMARK_OPT_STRIKETHROUGH);
+  STR_EQ(runner, html, "<p><del>line one\nline two</del></p>\n",
+         "strikethrough spanning lines");
+  free(html);
+
+  // Test: sourcepos on lazy continuation line
+  {
+    static const char markdown[] = "- Line One\n~~Deleted~~ Text";
+    cmark_node *doc = cmark_parse_document(markdown, sizeof(markdown) - 1,
+                                           CMARK_OPT_SOURCEPOS | CMARK_OPT_STRIKETHROUGH);
+    char *xml = cmark_render_xml(doc, CMARK_OPT_SOURCEPOS);
+    // ~~Deleted~~ on line 2 should start at column 1
+    OK(runner, strstr(xml, "strikethrough sourcepos=\"2:1-2:11\"") != NULL,
+       "strikethrough lazy continuation: correct sourcepos");
+    free(xml);
+    cmark_node_free(doc);
+  }
+}
+
 int main(void) {
   int retval;
   test_batch_runner *runner = test_batch_runner_new();
@@ -1290,6 +1379,7 @@ int main(void) {
   source_pos_inlines(runner);
   ref_source_pos(runner);
   lazy_continuation_sourcepos(runner);
+  strikethrough(runner);
 
   test_print_summary(runner);
   retval = test_ok(runner) ? 0 : 1;

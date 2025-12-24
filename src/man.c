@@ -244,6 +244,10 @@ static int S_render_node(cmark_renderer *renderer, cmark_node *node,
     }
     break;
 
+  case CMARK_NODE_STRIKETHROUGH:
+    // No standard strikethrough in man pages, just render content
+    break;
+
   case CMARK_NODE_EMPH:
     if (entering) {
       LIT("\\f[I]");

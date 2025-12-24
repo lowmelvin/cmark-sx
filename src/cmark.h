@@ -59,6 +59,7 @@ typedef enum {
   CMARK_NODE_CUSTOM_INLINE,
   CMARK_NODE_EMPH,
   CMARK_NODE_STRONG,
+  CMARK_NODE_STRIKETHROUGH,
   CMARK_NODE_LINK,
   CMARK_NODE_IMAGE,
 
@@ -641,6 +642,10 @@ char *cmark_render_latex(cmark_node *root, int options, int width);
  */
 #define CMARK_OPT_SMART (1 << 10)
 
+/** Enable strikethrough syntax with double tildes `~~like this~~`.
+ */
+#define CMARK_OPT_STRIKETHROUGH (1 << 11)
+
 /**
  * ## Version information
  */
@@ -689,6 +694,7 @@ const char *cmark_version_string(void);
 #define NODE_CUSTOM_INLINE CMARK_NODE_CUSTOM_INLINE
 #define NODE_EMPH CMARK_NODE_EMPH
 #define NODE_STRONG CMARK_NODE_STRONG
+#define NODE_STRIKETHROUGH CMARK_NODE_STRIKETHROUGH
 #define NODE_LINK CMARK_NODE_LINK
 #define NODE_IMAGE CMARK_NODE_IMAGE
 #define BULLET_LIST CMARK_BULLET_LIST
